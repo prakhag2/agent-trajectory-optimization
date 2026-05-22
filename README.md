@@ -239,12 +239,6 @@ Not knowledge. Not tool-calling mechanics. The **behavioral policy** inside the 
 
 After fine-tuning, the model plugs into any agent framework as a drop-in backend. The framework doesn't know the model was trajectory-optimized — it just sends messages and gets back tool calls or content.
 
-## Demo
-
-Live comparison of the base model vs. trajectory-optimized model running side-by-side:
-
-https://d3qrlbul6rodet.cloudfront.net/
-
 ---
 
 ## Files
