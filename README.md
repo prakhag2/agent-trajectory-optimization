@@ -2,6 +2,8 @@
 
 Optimizing how a small LLM behaves inside an agentic loop by fine-tuning on expert agent trajectories.
 
+The approach is **generically applicable** to any tool-calling agent — code generation, API orchestration, data pipelines, web browsing — anywhere a model must make sequential decisions in a loop. We demonstrate it on NL2SQL because it's concrete, easy to evaluate, and exposes the problem clearly.
+
 ---
 
 ## Background: NL2SQL Is "Solved" Until It Isn't
@@ -236,6 +238,12 @@ Not knowledge. Not tool-calling mechanics. The **behavioral policy** inside the 
 ## Serving
 
 After fine-tuning, the model plugs into any agent framework as a drop-in backend. The framework doesn't know the model was trajectory-optimized — it just sends messages and gets back tool calls or content.
+
+## Demo
+
+Live comparison of the base model vs. trajectory-optimized model running side-by-side:
+
+https://d3qrlbul6rodet.cloudfront.net/
 
 ---
 
