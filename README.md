@@ -2,11 +2,96 @@
 
 Optimizing how a small LLM behaves inside an agentic loop by fine-tuning on expert agent trajectories.
 
+---
+
+## Background: NL2SQL Is "Solved" Until It Isn't
+
+Natural language to SQL is one of the most common agent use cases. The pattern looks simple: user asks a question, agent writes SQL, database returns results, agent summarizes. With a capable model behind it, this works remarkably well — demos look magical.
+
+But in production, you hit a wall. Real databases don't look like textbook examples:
+
+- **Schema scale**: Not 5 tables with obvious names. Try 90 tables, some with 77+ columns, where the revenue data lives in `ArItem` (Accounts Receivable Item), not anything called "revenue" or "billing."
+- **Naming inconsistencies**: `Admission` (77 columns, PascalCase) coexists with `admissions` (19 columns, snake_case). Same concept, completely different structures. Which one has the data you need?
+- **Hidden relationships**: Bed occupancy requires joining `BedTransfer` → `Bed` → `Class`. Patient financials require `ArItem` → `Admission` → `PatientOrganization`. No column is named helpfully enough to guess this.
+- **Column ambiguity**: Five patient-related tables (`Patient`, `PatientOrganization`, `PatientBalance`, `PatientAttribute`, `PatientStatus`) — a model can't know which has the right columns without looking.
+
+A large model handles this by treating it as an **exploration problem** — `SHOW TABLES`, `DESCRIBE`, small test queries, then targeted JOINs using columns it actually discovered. A small model skips all of this, writes a query referencing columns it assumes exist, and fails.
+
+### The experiment behind this repo
+
+This work came from building a SQL agent against a hospital management database (90 tables, 450+ questions ranging from "How much revenue last month?" to "Which insurance payers bring the most patients across all facilities?"). The agent framework is [Strands Agents SDK](https://github.com/strands-agents/sdk-python) with a single tool — `sql_executor`:
+
+```python
+agent = Agent(
+    system_prompt="You are a SQL expert that solves problems through incremental exploration...",
+    model=model,
+    tools=[sql_executor]
+)
+result = agent("Which doctors generate the most revenue by specialty?")
+```
+
+Strands runs the agent loop: sends messages to the model → parses tool calls → executes SQL → appends results → loops until the model responds with a final answer instead of another tool call.
+
+### How a well-behaved agent solves this
+
+With a large model, the agent explores methodically:
+
+```
+Step 1: SHOW DATABASES                          → discovers hospital_db
+Step 2: SHOW TABLES FROM hospital_db            → sees 90 tables
+Step 3: DESCRIBE hospital_db.ArItem             → finds NetAmount, AdmissionId (90 columns)
+Step 4: DESCRIBE hospital_db.Admission          → finds PatientId, DoctorUserId (77 columns)
+Step 5: SELECT ... FROM ArItem JOIN Admission   → uses actual discovered column names
+Step 6: "Based on the data, Dr. Smith generated $125K..."
+```
+
+When a query fails (`ERROR: Unknown column 'ai.BedId'`), it reasons: *"ArItem doesn't have BedId. Let me DESCRIBE ArItem to see what columns are actually there."* It adapts and continues.
+
+### How an unoptimized small model breaks
+
+The same agent with a small model:
+
+```
+Step 1: SELECT p.name, SUM(b.total_amount) as revenue
+        FROM patients p JOIN billing b ON p.patient_id = b.patient_id
+        JOIN doctors d ON b.doctor_id = d.id
+        GROUP BY d.specialty
+        
+→ ERROR: Table 'hospital_db.billing' doesn't exist
+```
+
+There is no `billing` table — the model hallucinated it based on what hospital databases "probably" look like. The actual table is `ArItem`. The patient column is `PatientId` not `patient_id`. The doctor reference is `DoctorUserId` not `doctor_id`.
+
+After the error:
+- Retries with `bills` or `invoices` (still hallucinated)
+- Switches to `admissions` (the wrong 19-column table lacking financial data)
+- Or gives up: "I cannot determine this without schema information"
+
+Even when it survives initial steps, it fails deeper. It writes a JOIN referencing `ArItem.BedId` — a column that does not exist in a 90-column table. It cannot know this without running `DESCRIBE` first, and it never does.
+
+### The core gap
+
+The small model knows *how* to make tool calls. It produces valid `<tool_call>` syntax. What it lacks is the **strategic reasoning** that makes tool calls effective:
+
+- **Explore before assuming** — the discipline to DESCRIBE tables before writing queries
+- **Connect observations** — reasoning like "I see BedTransfer has BedId, Bed has ClassId, so I can get occupancy per bed class"
+- **Recover from errors** — interpreting "Unknown column" as "I need to check the actual schema" rather than guessing a different wrong name
+- **Know when to stop** — recognizing sufficient data vs. continuing to explore irrelevant tables
+
+This isn't a knowledge problem or a format problem. It's a **behavioral policy problem** — the model needs to learn a different decision-making strategy inside the agent loop.
+
+### Why this generalizes
+
+The same pattern breaks small-model agents anywhere the environment is too complex to guess:
+- Code agents that assume file paths or function signatures without checking
+- API agents that guess endpoint parameters instead of reading schemas
+- Data pipeline agents that write transformations without inspecting actual data shapes
+
+---
+
 ## Why This Is Different From Standard LLM Fine-tuning
 
-Standard LLM fine-tuning operates on **single-turn input→output pairs**. You give the model a prompt, it produces a response, done.
-
-Agent execution is fundamentally different:
+Standard fine-tuning: single-turn **input→output**. Agent execution: **multi-step decision loop**.
 
 ```
 Standard fine-tuning:           Agent execution:
@@ -17,32 +102,19 @@ Standard fine-tuning:           Agent execution:
                                           (loop N times, then answer)
 ```
 
-An agent operates in a **multi-step decision loop** where:
+What makes agent training fundamentally harder:
 
-1. **Each step depends on all previous steps.** The model reasons about accumulated context — what tools returned, what failed, what's been learned so far.
+1. **Each step depends on all previous steps.** The model reasons about accumulated context — what tools returned, what failed, what's been learned.
 
-2. **The model decides WHAT to do, not just what to say.** At each step it chooses between calling a tool (which one, with what arguments) or stopping and answering. This is a policy decision, not text generation.
+2. **The model decides WHAT to do, not just what to say.** Call a tool (which one, what arguments) or stop and answer. A policy decision, not text generation.
 
-3. **The context grows with each step.** By step 6, the model sees full history of prior tool calls and results. It must reason over all of this to decide the next action.
+3. **The context grows with each step.** By step 6 the model sees everything. It must reason over all prior results to decide the next action.
 
-4. **Errors are part of the loop.** When a tool call fails, the model must interpret the error, adjust its approach, and try something different.
+4. **Errors are part of the loop.** Failed tool calls require interpreting the error and adjusting — not just producing the next token.
 
-5. **Knowing when to stop is critical.** Over-exploration wastes tokens and money. Under-exploration gives wrong answers. The termination decision is as important as any tool call.
+5. **Knowing when to stop is critical.** Over-exploration wastes tokens and cost. Under-exploration gives wrong answers.
 
-### The Problem With Small Models as Agents
-
-Small models (4B-30B) know the *mechanics* of tool calling — they produce `<tool_call>` tokens in the right format. What they lack is **strategic behavior**:
-
-- They try to write the perfect query immediately (skipping exploration → fails)
-- They don't connect results from step 3 to decisions at step 5
-- They don't know when they have enough information to stop
-- They don't recover gracefully from errors
-
-A large model (70B+) does this naturally. The goal: transfer that behavioral policy into the small model.
-
-### Why Standard Fine-tuning Doesn't Solve This
-
-Fine-tuning on (question, final_answer) pairs teaches what good answers look like, not how to *arrive* at them through a tool-calling loop. The model needs to learn the **intermediate decision-making** — what to do at step 1, what to do at step 4 given what steps 1-3 revealed, and when to stop at step 7.
+Fine-tuning on (question, final_answer) pairs teaches what good answers look like, not how to *arrive* at them through multi-step tool use. The model needs to learn the **intermediate decisions** — what to do at step 1, what to do at step 4 given what steps 1-3 revealed, when to stop at step 7.
 
 ---
 
